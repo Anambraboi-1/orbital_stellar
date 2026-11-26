@@ -8,6 +8,7 @@
 - `verifyAttestation` now enforces `expiresAt` (a missing or unparseable value is not treated as "never expires"; pass `checkExpiry: false` to opt out), and failures carry a stable `code` alongside `reason`.
 
 ### Added
+- `OnChainAbiRegistryClient.listRegisteredContracts()` lists the contracts that have published a spec to the registry, by scanning its `SpecPublished` events over a bounded ledger window (`DEFAULT_LOOKBACK_LEDGERS`, about 24h). It keeps the latest publication per contract and filters by publisher. Results only cover what the RPC still retains.
 - **Attestation policy** - `resolveAttestations`/`resolveAttestationsWithDeployer` rank a contract's attestations by trust tier (`deployer` > `third-party` > `unbound`), follow `supersedes` chains (same attester only), drop expired and wrong-contract or wrong-version claims, and flag conflicting events. `attestationHash`, `classifyAttester`, `meetsMinimumTrust` are exported alongside.
 - `schemas/attestation-envelope.schema.json` - the envelope's wire format.
 - `test-vectors/attestation-v1.json` - a language-neutral conformance suite, plus reference verifiers in Go (`verifiers/go`) and Rust (`verifiers/rust`) that pass it in CI.

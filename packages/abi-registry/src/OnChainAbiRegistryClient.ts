@@ -139,6 +139,49 @@ export type SpecRecord = {
 };
 
 /**
+ * One contract's most recently observed publication, as returned by
+ * {@link OnChainAbiRegistryClient.listRegisteredContracts}.
+ */
+export type RegisteredContractSummary = {
+  /** The contract whose spec was published. */
+  contractId: string;
+  /** Address of the publisher that registered the spec. */
+  publisher: string;
+  /**
+   * The version published at the highest ledger within the scanned window.
+   * A more recent publish outside the window is not seen.
+   */
+  latestVersion: string;
+  /** Hex-encoded SHA-256 hash of the spec content. */
+  specHash: string;
+  /** Off-chain URI pointer where the spec blob is hosted. */
+  pointer: string;
+  /** Ledger sequence number of the `SpecPublished` event. */
+  publishedAtLedger: number;
+};
+
+/** Options for {@link OnChainAbiRegistryClient.listRegisteredContracts}. */
+export type ListRegisteredContractsOptions = {
+  /**
+   * How many ledgers of registry history to scan, counting back from the
+   * latest ledger. Soroban RPC only keeps a bounded window of events, so this
+   * is a bounded scan, not a full index. Defaults to
+   * {@link DEFAULT_LOOKBACK_LEDGERS}.
+   */
+  lookbackLedgers?: number;
+  /** Only return specs from this publisher. Defaults to `config.publisher`. */
+  publisher?: string;
+  /** Maximum events fetched per `getEvents` page. Defaults to 100. */
+  pageLimit?: number;
+};
+
+/** About 24 hours of ledgers at Stellar's ~5s close time. */
+export const DEFAULT_LOOKBACK_LEDGERS = 17_280;
+
+/** `topic[0]` of the registry's `SpecPublished` event (soroban-sdk snake_cases the struct name). */
+const SPEC_PUBLISHED_TOPIC = "spec_published";
+
+/**
  * Resolves {@link ContractSpec}s by reading the on-chain Orbital ABI registry
  * contract directly via Soroban RPC simulation (no HTTP registry server
  * involved). For each `(contract_id, publisher)` pair this fetches every
@@ -222,6 +265,68 @@ export class OnChainAbiRegistryClient {
    */
   async getRecords(contractId: string): Promise<ReadonlyArray<SpecRecord>> {
     return this.getRecordsInternal(contractId);
+  }
+
+  /**
+   * Lists the contracts that have published a spec to this registry, by
+   * scanning the registry contract's own `SpecPublished` events through
+   * `getEvents` and keeping the highest-ledger publication per contract.
+   *
+   * The registry keys every record by `(contract_id, publisher, version)` and
+   * has no on-chain index of all contracts, so events are the only way to
+   * enumerate it. This is a bounded scan: it sees back as far as
+   * `options.lookbackLedgers` or the RPC's event retention, whichever is
+   * shorter. An empty result means nothing was published in that window, not
+   * that nothing was ever published.
+   *
+   * Results are sorted by `contractId`.
+   */
+  async listRegisteredContracts(
+    options: ListRegisteredContractsOptions = {},
+  ): Promise<RegisteredContractSummary[]> {
+    const server = new SorobanRpc.Server(this.config.rpcUrl);
+    const publisherFilter = options.publisher ?? this.config.publisher;
+    const pageLimit = options.pageLimit ?? 100;
+    const lookback = options.lookbackLedgers ?? DEFAULT_LOOKBACK_LEDGERS;
+
+    const { sequence: latestLedger } = await this.withTransportRetry(
+      () => server.getLatestLedger(),
+      "getLatestLedger",
+    );
+    const startLedger = Math.max(1, latestLedger - lookback);
+    const filters: SorobanRpc.Api.EventFilter[] = [
+      { type: "contract", contractIds: [this.config.contractId] },
+    ];
+
+    const byContract = new Map<string, RegisteredContractSummary>();
+    let cursor: string | undefined;
+
+    for (;;) {
+      const request: SorobanRpc.Server.GetEventsRequest = cursor
+        ? { cursor, filters, limit: pageLimit }
+        : { startLedger, filters, limit: pageLimit };
+      const page = await this.withTransportRetry(
+        () => server.getEvents(request),
+        `getEvents(${this.config.contractId})`,
+      );
+
+      for (const event of page.events) {
+        const summary = parseSpecPublishedEvent(event, publisherFilter);
+        if (!summary) continue;
+        const existing = byContract.get(summary.contractId);
+        if (!existing || summary.publishedAtLedger > existing.publishedAtLedger) {
+          byContract.set(summary.contractId, summary);
+        }
+      }
+
+      if (page.events.length < pageLimit) break;
+      // An event's `id` doubles as its paging cursor when the RPC omits a page cursor.
+      const next = page.cursor || page.events[page.events.length - 1]?.id;
+      if (!next || next === cursor) break;
+      cursor = next;
+    }
+
+    return [...byContract.values()].sort((a, b) => a.contractId.localeCompare(b.contractId));
   }
 
   private async getRecordsInternal(contractId: string): Promise<SpecRecord[]> {
@@ -474,5 +579,42 @@ export class OnChainAbiRegistryClient {
     if (typeof data === "string") return data;
     const encodable = data as { toXDR?: (format: "base64") => string } | undefined;
     return typeof encodable?.toXDR === "function" ? encodable.toXDR("base64") : undefined;
+  }
+}
+
+/**
+ * Decodes one `getEvents` record as a registry `SpecPublished` event, or
+ * returns `null` when it is a different event (`worker_registered`,
+ * `operator_registered`), comes from another publisher, or fails to decode.
+ *
+ * `#[contractevent]` puts the snake_case event name in `topic[0]`, then the
+ * `#[topic]` fields in order: `contract_id`, `version`. The other fields
+ * (`spec_hash`, `pointer`, `publisher`) are in `value`.
+ */
+function parseSpecPublishedEvent(
+  event: { topic: xdr.ScVal[]; value: xdr.ScVal; ledger: number },
+  publisherFilter: string,
+): RegisteredContractSummary | null {
+  try {
+    if (event.topic.length < 3) return null;
+    if (scValToNative(event.topic[0]!) !== SPEC_PUBLISHED_TOPIC) return null;
+
+    const data = scValToNative(event.value) as Record<string, unknown>;
+    const publisher = String(data["publisher"]);
+    if (publisher !== publisherFilter) return null;
+
+    const specHash = data["spec_hash"];
+    if (!(specHash instanceof Uint8Array)) return null;
+
+    return {
+      contractId: String(scValToNative(event.topic[1]!)),
+      publisher,
+      latestVersion: String(scValToNative(event.topic[2]!)),
+      specHash: Buffer.from(specHash).toString("hex"),
+      pointer: String(data["pointer"]),
+      publishedAtLedger: event.ledger,
+    };
+  } catch {
+    return null;
   }
 }

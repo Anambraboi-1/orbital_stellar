@@ -63,8 +63,14 @@ export type { OnChainRegistryPublisherConfig } from "./OnChainRegistryPublisher.
 export {
   OnChainAbiRegistryClient,
   RegistryEntryArchivedError,
+  DEFAULT_LOOKBACK_LEDGERS,
 } from "./OnChainAbiRegistryClient.js";
-export type { OnChainAbiRegistryClientConfig, SpecRecord } from "./OnChainAbiRegistryClient.js";
+export type {
+  OnChainAbiRegistryClientConfig,
+  SpecRecord,
+  RegisteredContractSummary,
+  ListRegisteredContractsOptions,
+} from "./OnChainAbiRegistryClient.js";
 
 export { BundledWellKnownClient } from "./BundledWellKnownClient.js";
 export { ChainedAbiRegistryClient } from "./ChainedAbiRegistryClient.js";

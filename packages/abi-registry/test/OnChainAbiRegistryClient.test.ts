@@ -77,6 +77,53 @@ function installMockServer(simulateTransaction: ReturnType<typeof vi.fn>): MockS
   return server;
 }
 
+function installMockEventsServer(server: {
+  getEvents: ReturnType<typeof vi.fn>;
+  getLatestLedger: ReturnType<typeof vi.fn>;
+}): void {
+  (SorobanRpc.Server as unknown as ReturnType<typeof vi.fn>).mockImplementation(function (
+    this: unknown,
+  ) {
+    return server;
+  });
+}
+
+/**
+ * Builds a `getEvents` record shaped like the registry's `SpecPublished`
+ * event: `#[contractevent]` puts the snake_case event name in `topic[0]`,
+ * then the `#[topic]` fields (`contract_id`, `version`); the other fields
+ * live in `value`.
+ */
+function specPublishedEvent(record: {
+  contractId: string;
+  version: string;
+  specHash: Buffer;
+  pointer: string;
+  publisher: string;
+  ledger: number;
+  eventName?: string;
+}): { id: string; topic: xdr.ScVal[]; value: xdr.ScVal; ledger: number } {
+  const entry = (key: string, val: xdr.ScVal) =>
+    new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol(key), val });
+
+  return {
+    id: `${record.ledger}-0`,
+    topic: [
+      xdr.ScVal.scvSymbol(record.eventName ?? "spec_published"),
+      new Address(record.contractId).toScVal(),
+      xdr.ScVal.scvString(record.version),
+    ],
+    value: xdr.ScVal.scvMap([
+      entry("spec_hash", xdr.ScVal.scvBytes(record.specHash)),
+      entry("pointer", xdr.ScVal.scvString(record.pointer)),
+      entry("publisher", new Address(record.publisher).toScVal()),
+    ]),
+    ledger: record.ledger,
+  };
+}
+
+const sha = (s: string) => createHash("sha256").update(s).digest();
+
 const MAX_PAGE_SIZE = 25;
 
 /** Routes simulateTransaction calls to list_versions / list_versions_paged / get_version based on the invoked function name. */
@@ -501,5 +548,174 @@ describe("OnChainAbiRegistryClient - transport retry", () => {
 
     await expect(makeClient().getSpec(TARGET_CONTRACT_ID)).rejects.toThrow(/simulation of/);
     expect(simulate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("OnChainAbiRegistryClient.listRegisteredContracts", () => {
+  const OTHER_CONTRACT_ID = StrKey.encodeContract(Buffer.alloc(32, 9));
+  const OTHER_PUBLISHER = Keypair.random().publicKey();
+
+  it("returns one summary per contract, keeping the highest-ledger publication", async () => {
+    const getLatestLedger = vi.fn().mockResolvedValue({ sequence: 50_000 });
+    const getEvents = vi.fn().mockResolvedValue({
+      events: [
+        specPublishedEvent({
+          contractId: TARGET_CONTRACT_ID,
+          version: "2.0.0",
+          specHash: sha("v2"),
+          pointer: "https://example.com/v2.json",
+          publisher: PUBLISHER_ADDRESS,
+          ledger: 200,
+        }),
+        specPublishedEvent({
+          contractId: TARGET_CONTRACT_ID,
+          version: "1.0.0",
+          specHash: sha("v1"),
+          pointer: "https://example.com/v1.json",
+          publisher: PUBLISHER_ADDRESS,
+          ledger: 100,
+        }),
+      ],
+      cursor: "",
+      latestLedger: 50_000,
+    });
+    installMockEventsServer({ getEvents, getLatestLedger });
+
+    const result = await makeClient().listRegisteredContracts();
+
+    expect(result).toEqual([
+      {
+        contractId: TARGET_CONTRACT_ID,
+        publisher: PUBLISHER_ADDRESS,
+        latestVersion: "2.0.0",
+        specHash: sha("v2").toString("hex"),
+        pointer: "https://example.com/v2.json",
+        publishedAtLedger: 200,
+      },
+    ]);
+    expect(getEvents).toHaveBeenCalledWith(
+      expect.objectContaining({
+        startLedger: 50_000 - 17_280,
+        filters: [{ type: "contract", contractIds: [REGISTRY_CONTRACT_ID] }],
+      }),
+    );
+  });
+
+  it("clamps the scan start to ledger 1 on a young chain", async () => {
+    const getLatestLedger = vi.fn().mockResolvedValue({ sequence: 1000 });
+    const getEvents = vi.fn().mockResolvedValue({ events: [], cursor: "", latestLedger: 1000 });
+    installMockEventsServer({ getEvents, getLatestLedger });
+
+    await makeClient().listRegisteredContracts();
+
+    expect(getEvents.mock.calls[0]![0]).toEqual(expect.objectContaining({ startLedger: 1 }));
+  });
+
+  it("filters out publications by a different publisher", async () => {
+    const getLatestLedger = vi.fn().mockResolvedValue({ sequence: 1000 });
+    const getEvents = vi.fn().mockResolvedValue({
+      events: [
+        specPublishedEvent({
+          contractId: OTHER_CONTRACT_ID,
+          version: "1.0.0",
+          specHash: sha("other"),
+          pointer: "https://example.com/other.json",
+          publisher: OTHER_PUBLISHER,
+          ledger: 150,
+        }),
+      ],
+      cursor: "",
+      latestLedger: 1000,
+    });
+    installMockEventsServer({ getEvents, getLatestLedger });
+    const client = makeClient();
+
+    expect(await client.listRegisteredContracts()).toEqual([]);
+    expect(await client.listRegisteredContracts({ publisher: OTHER_PUBLISHER })).toHaveLength(1);
+  });
+
+  it("skips the registry's other events", async () => {
+    const getLatestLedger = vi.fn().mockResolvedValue({ sequence: 1000 });
+    const getEvents = vi.fn().mockResolvedValue({
+      events: ["worker_registered", "operator_registered"].map((eventName, i) =>
+        specPublishedEvent({
+          contractId: OTHER_CONTRACT_ID,
+          version: "1.0.0",
+          specHash: sha(eventName),
+          pointer: "https://example.com/x.json",
+          publisher: PUBLISHER_ADDRESS,
+          ledger: 150 + i,
+          eventName,
+        }),
+      ),
+      cursor: "",
+      latestLedger: 1000,
+    });
+    installMockEventsServer({ getEvents, getLatestLedger });
+
+    expect(await makeClient().listRegisteredContracts()).toEqual([]);
+  });
+
+  it("pages through getEvents with the returned cursor until a short page", async () => {
+    const getLatestLedger = vi.fn().mockResolvedValue({ sequence: 1000 });
+    const page1 = [0, 1].map((i) =>
+      specPublishedEvent({
+        contractId: TARGET_CONTRACT_ID,
+        version: `1.${i}.0`,
+        specHash: sha(`p1-${i}`),
+        pointer: `https://example.com/p1-${i}.json`,
+        publisher: PUBLISHER_ADDRESS,
+        ledger: 100 + i,
+      }),
+    );
+    const getEvents = vi
+      .fn()
+      .mockResolvedValueOnce({ events: page1, cursor: "cursor-1", latestLedger: 1000 })
+      .mockResolvedValueOnce({
+        events: [
+          specPublishedEvent({
+            contractId: OTHER_CONTRACT_ID,
+            version: "1.0.0",
+            specHash: sha("p2"),
+            pointer: "https://example.com/p2.json",
+            publisher: PUBLISHER_ADDRESS,
+            ledger: 300,
+          }),
+        ],
+        cursor: "cursor-2",
+        latestLedger: 1000,
+      });
+    installMockEventsServer({ getEvents, getLatestLedger });
+
+    const result = await makeClient().listRegisteredContracts({ pageLimit: 2 });
+
+    expect(getEvents).toHaveBeenCalledTimes(2);
+    const second = getEvents.mock.calls[1]![0];
+    expect(second).toEqual(expect.objectContaining({ cursor: "cursor-1" }));
+    expect(second).not.toHaveProperty("startLedger");
+    expect(result.map((r) => r.contractId)).toEqual([TARGET_CONTRACT_ID, OTHER_CONTRACT_ID].sort());
+    expect(result.find((r) => r.contractId === TARGET_CONTRACT_ID)?.latestVersion).toBe("1.1.0");
+  });
+
+  it("stops paging when the RPC hands back the same cursor", async () => {
+    const getLatestLedger = vi.fn().mockResolvedValue({ sequence: 1000 });
+    const full = [0, 1].map((i) =>
+      specPublishedEvent({
+        contractId: TARGET_CONTRACT_ID,
+        version: `1.${i}.0`,
+        specHash: sha(`s-${i}`),
+        pointer: `https://example.com/s-${i}.json`,
+        publisher: PUBLISHER_ADDRESS,
+        ledger: 100 + i,
+      }),
+    );
+    const getEvents = vi
+      .fn()
+      .mockResolvedValue({ events: full, cursor: "stuck", latestLedger: 1000 });
+    installMockEventsServer({ getEvents, getLatestLedger });
+
+    await makeClient().listRegisteredContracts({ pageLimit: 2 });
+
+    expect(getEvents).toHaveBeenCalledTimes(2);
   });
 });
